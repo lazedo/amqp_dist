@@ -380,10 +380,18 @@ dist_cntrlr_setup_loop(Pid, TickHandler, Sup) ->
             dist_cntrlr_setup_loop(Pid, TickHandler, Sup);
 
         {Ref, From, pre_nodeup} ->
+
+            %% amqp_dist_node must agree
+            ok = amqp_dist_node:pre_nodeup(Pid),
+
             From ! {Ref, ok},
             dist_cntrlr_setup_loop(Pid, TickHandler, Sup);
 
         {Ref, From, post_nodeup} ->
+
+            %% amqp_dist_node must agree
+            ok = amqp_dist_node:post_nodeup(Pid),
+
             From ! {Ref, ok},
             dist_cntrlr_setup_loop(Pid, TickHandler, Sup);
 

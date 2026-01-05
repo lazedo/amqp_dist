@@ -25,6 +25,7 @@
         ,controller/2
         ,receiver/2
         ,handshake_complete/2
+        ,pre_nodeup/1, post_nodeup/1
         ]).
 
 -define(PHASE_CHECK_INTERVAL, 20000).
@@ -94,6 +95,14 @@ handle_call(recv, _From, #{data := Data} = State) ->
         {{value, Value}, Q} -> {reply, {ok, Value}, State#{data => Q}};
         {empty, Q} -> {reply, {error, empty}, State#{data => Q}}
     end;
+
+handle_call(pre_nodeup, _From, #{phase := Phase, node := Node} = State) ->
+    ?LOG_INFO("pre_nodeup node ~s on ~s phase", [Node, Phase]),
+    {reply, ok, State};
+
+handle_call(post_nodeup, _From, #{phase := Phase, node := Node} = State) ->
+    ?LOG_INFO("post_nodeup node ~s on ~s phase", [Node, Phase]),
+    {reply, ok, State};
 
 handle_call({handshake_complete, Node}, _From, #{phase := handshake, node := Node} = State) ->
     ?LOG_INFO("handshake succeeded for node ~s", [Node]),
@@ -417,3 +426,9 @@ set_phase(State, Phase) ->
 
 handshake_complete(Pid, Node) ->
     gen_server:call(Pid, {handshake_complete, Node}).
+
+pre_nodeup(Pid) ->
+    gen_server:call(Pid, pre_nodeup).
+
+post_nodeup(Pid) ->
+    gen_server:call(Pid, post_nodeup).
