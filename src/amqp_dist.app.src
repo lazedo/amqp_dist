@@ -6,7 +6,8 @@
                   {heartbeat_timeout_ms, 45000},
                   {connection_timeout_ms, 10000},
                   {pause_before_reconnect_ms, 3500},
-                  {server_call_timeout_ms, 750}
+                  {server_call_timeout_ms, 750},
+                  {send_mode, async}
               ]},
               {modules,[]},
               {registered,[]},

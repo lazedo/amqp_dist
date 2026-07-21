@@ -26,6 +26,7 @@
 -export([add_broker/1, add_brokers/1]).
 -export([heartbeat_labels/0, set_heartbeat_labels/1]).
 -export([parameter/1, set_parameter/2]).
+-export([send_mode/0, set_send_mode/1]).
 -export([nodes/0]).
 -export([is_up/1]). 
   
@@ -77,6 +78,31 @@ set_parameter(Param, Value) ->
 parameter(Param) ->
     amqp_dist_acceptor:parameter(Param).
 
+%% send/2 dispatch mode. Unlike `parameter', this lives in a persistent_term
+%% (read on every send) rather than the app env: seeded once at startup from
+%% the `send_mode' app env (default async), then changed at runtime with
+%% set_send_mode/1. async = cast (fire-and-forget), sync = call (back pressure).
+-spec send_mode() -> async | sync.
+send_mode() ->
+    persistent_term:get(?AMQP_DIST_SEND_MODE, ?AMQP_DIST_SEND_MODE_DEFAULT).
+
+-spec set_send_mode(async | sync) -> ok.
+set_send_mode(Mode) when Mode =:= async; Mode =:= sync ->
+    persistent_term:put(?AMQP_DIST_SEND_MODE, Mode).
+
+%% Seed the persistent_term from the app env at startup (create_acceptor).
+%% Anything other than `sync' falls back to the async default.
+-spec init_send_mode() -> ok.
+init_send_mode() ->
+    set_send_mode(send_mode_from_env()).
+
+-spec send_mode_from_env() -> async | sync.
+send_mode_from_env() ->
+    case application:get_env(amqp_dist, send_mode, ?AMQP_DIST_SEND_MODE_DEFAULT) of
+        sync -> sync;
+        _ -> async
+    end.
+
 %% ------------------------------------------------------------
 %%  Select this protocol based on node name
 %%  select(Node) => Bool
@@ -105,6 +131,7 @@ listen(Name) ->
 
 create_acceptor(Name) ->
     application:load(amqp_dist),
+    init_send_mode(),
     amqp_dist_acceptor:start(self(), Name).
 
 

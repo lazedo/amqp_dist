@@ -358,8 +358,17 @@ decr_timeout({Start, Timeout}) ->
     Now = erlang:system_time(millisecond),
     {Now, Timeout - (Now - Start)}.
 
+%% Dispatch a payload to the link's gen_server. The mode is read from the
+%% persistent_term seeded at startup (see amqp_dist:init_send_mode/0):
+%%   async (default) -> cast, the sender never blocks on the publish;
+%%   sync            -> call, the sender waits for the publish result (back
+%%                      pressure). Change at runtime with amqp_dist:set_send_mode/1.
 send(Pid, Data) ->
-    gen_server:call(Pid, {send, Data}).
+    case persistent_term:get(?AMQP_DIST_SEND_MODE, ?AMQP_DIST_SEND_MODE_DEFAULT) of
+        sync -> gen_server:call(Pid, {send, Data});
+        async -> gen_server:cast(Pid, {send, Data});
+        _Other -> gen_server:cast(Pid, {send, Data})
+    end.
 
 tick(Pid) ->
     gen_server:cast(Pid, tick).
