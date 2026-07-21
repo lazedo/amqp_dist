@@ -30,6 +30,19 @@
 
 -define(PHASE_CHECK_INTERVAL, 20000).
 
+%% Shared ETS table for per-link byte counters. `stats/1' reads directly
+%% from this table — never enters the gen_server message queue — so probes
+%% (`prometheus_basic_stats', `net_kernel:nodes_info/0', etc) won't block
+%% behind a heavy `send' under load. Writes happen inline inside the
+%% gen_server where the link state lives, so they remain serialised
+%% relative to send/recv on the same link, but readers race past freely.
+%%
+%% Row shape: `{Pid, RecvBytes, SentBytes}'. `ets:update_counter/4' with a
+%% default-row arg auto-inserts on first bump.
+-define(STATS_TAB, 'amqp_dist_node_stats').
+-define(POS_RECV, 2).
+-define(POS_SENT, 3).
+
 %%--------------------------------------------------------------------------
 %% API
 %%--------------------------------------------------------------------------
@@ -56,6 +69,8 @@ publish(Data, #{channel := Channel, queue := Q, exchange := X, remote_queue := R
 %% @private
 init([Connection, Label, Node, Queue, Action]) ->
     process_flag(trap_exit, true),
+    ensure_stats_table(),
+    ets:insert(?STATS_TAB, {self(), 0, 0}),
     start_amqp(#{phase => init
                 ,remote_queue => Queue
                 ,node => Node
@@ -63,20 +78,21 @@ init([Connection, Label, Node, Queue, Action]) ->
                 ,connection_label => Label
                 ,exchange => <<>>
                 ,data => queue:new()
-                ,sent => 0
-                ,recv => 0
                 ,action => Action
                 }).
 
 %% Closes the channel this gen_server instance started
 %% @private
 terminate(shutdown, State) ->
+    drop_stats_row(),
     log_termination(shutdown, State),
     ok;
 terminate(killed, State) ->
+    drop_stats_row(),
     log_termination(killed, State),
     ok;
 terminate(Reason, State) ->
+    drop_stats_row(),
     catch(stop_node(State)),
     log_termination(Reason, State),
     ok.
@@ -112,15 +128,20 @@ handle_call({handshake_complete, HNode}, _From, #{phase := Phase, node := Node} 
     ?LOG_ERROR("handshake complete for node ~s with wrong local data ~p", [HNode, {Phase, Node}]),
     {reply, {error, wrong_state_or_pid}, State};
 
-handle_call({send, Data}, _From, #{sent := Sent} = State) ->
+handle_call({send, Data}, _From, State) ->
     {Result, Size} = publish(Data, State),
-    {reply, Result, State#{sent => Sent + Size}};
+    bump_stat(?POS_SENT, Size),
+    {reply, Result, State};
 
 handle_call({connected, Receiver}, _From, State) ->
     {reply, ok, set_phase(State#{receiver => Receiver}, connected)};
 
-handle_call(stats, _From, #{sent := Sent, recv := Received} = State) ->
-    {reply, {ok, Received, Sent, false}, State};
+handle_call(stats, _From, State) ->
+    %% Legacy gen_server path. The public `stats/1' API reads ETS directly
+    %% and never enters this gen_server; kept here only so callers that
+    %% still use `gen_server:call(Pid, stats)' keep working.
+    {Recv, Sent} = read_stats(self()),
+    {reply, {ok, Recv, Sent, false}, State};
 
 handle_call({setup, connect}, From, State) ->
     publish({amqp_dist, connect}, State),
@@ -155,12 +176,15 @@ handle_cast(tick, #{phase := handshake, node := Node} = State) ->
     ?LOG_INFO("connected to ~s", [Node]),
     handle_cast(tick, State#{phase => connected});
 
-handle_cast(tick, #{sent := Sent} = State) ->
+handle_cast(tick, State) ->
     {_Result, Size} = publish(keep_alive, State),
-    {noreply, State#{sent => Sent + Size}};
+    bump_stat(?POS_SENT, Size),
+    {noreply, State};
 
-%% handle_cast(tick, #{sent := Sent, recv := Received} = State) ->
-%%     {noreply, State#{sent => Sent + 1, recv => Received + 1}};
+handle_cast({send, Data}, State) ->
+    {_Result, Size} = publish(Data, State),
+    bump_stat(?POS_SENT, Size),
+    {noreply, State};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -208,12 +232,10 @@ handle_info({#'basic.deliver'{}
             ,State = #{phase := handshake
                       ,remote_queue := Queue
                       ,data := QData
-                      ,recv := Recv
                       }) ->
     Data = decode(Payload),
-    {noreply, State#{recv => Recv + byte_size(Payload)
-                    ,data => queue:in(Data, QData)
-                    }};
+    bump_stat(?POS_RECV, byte_size(Payload)),
+    {noreply, State#{data => queue:in(Data, QData)}};
 
 handle_info({#'basic.deliver'{}
             ,#amqp_msg{props = #'P_basic'{reply_to = Queue}
@@ -223,13 +245,13 @@ handle_info({#'basic.deliver'{}
             ,State = #{phase := connected
                       ,remote_queue := Queue
                       ,receiver := Receiver
-                      ,recv := Recv
                       }) ->
     case decode(Payload) of
         keep_alive -> ok;
         Data -> Receiver ! {data, self(), Data}
     end,
-    {noreply, State#{recv => Recv + byte_size(Payload)}};
+    bump_stat(?POS_RECV, byte_size(Payload)),
+    {noreply, State};
 
 handle_info({'DOWN', ControllerRef, process, Controller, _Info}
            ,#{controller := Controller, controller_ref := ControllerRef} = State) ->
@@ -345,8 +367,65 @@ tick(Pid) ->
 connected(Pid, Receiver) ->
     gen_server:call(Pid, {connected, Receiver}).
 
+%% Read the link's byte counters straight from ETS — no gen_server hop.
+%% Returns the legacy 4-tuple `{ok, RecvBytes, SentBytes, PendingFlag}'
+%% expected by `net_kernel:nodes_info/0' and similar probes. The pending
+%% flag has always been `false' from this module; preserved for shape.
 stats(Pid) ->
-    gen_server:call(Pid, stats).
+    {Recv, Sent} = read_stats(Pid),
+    {ok, Recv, Sent, false}.
+
+-spec read_stats(pid()) -> {non_neg_integer(), non_neg_integer()}.
+read_stats(Pid) ->
+    case ets:whereis(?STATS_TAB) of
+        'undefined' -> {0, 0};
+        _ ->
+            try ets:lookup(?STATS_TAB, Pid) of
+                [{_, Recv, Sent}] -> {Recv, Sent};
+                [] -> {0, 0}
+            catch
+                _:_ -> {0, 0}
+            end
+    end.
+
+%% The first writer creates the table; subsequent writers find it via
+%% `ets:whereis/1' and skip. Idempotent under races — the `badarg' raised
+%% when a peer beat us to `ets:new/2' is swallowed.
+ensure_stats_table() ->
+    case ets:whereis(?STATS_TAB) of
+        'undefined' ->
+            try ets:new(?STATS_TAB, ['named_table', 'public', 'set'
+                                    ,{'write_concurrency', 'true'}
+                                    ,{'read_concurrency', 'true'}
+                                    ,{'keypos', 1}
+                                    ])
+            of
+                _ -> 'ok'
+            catch
+                'error':'badarg' -> 'ok'
+            end;
+        _ -> 'ok'
+    end.
+
+drop_stats_row() ->
+    catch(ets:delete(?STATS_TAB, self())),
+    'ok'.
+
+%% Bump a stats column atomically. `ets:update_counter/4' accepts a default
+%% tuple that is inserted if the key is missing — handles processes that
+%% picked up the new code via hot reload without going through the new
+%% `init/1' (and so didn't insert their row themselves). Wrapped in `try'
+%% so a missing table (e.g. during shutdown after `terminate/2' dropped
+%% it) is silent.
+-spec bump_stat(pos_integer(), non_neg_integer()) -> 'ok'.
+bump_stat(_Pos, 0) -> 'ok';
+bump_stat(Pos, Incr) ->
+    ensure_stats_table(),
+    try ets:update_counter(?STATS_TAB, self(), {Pos, Incr}, {self(), 0, 0}) of
+        _ -> 'ok'
+    catch
+        _:_ -> 'ok'
+    end.
 
 setup(Pid) ->
     gen_server:call(Pid, setup).
